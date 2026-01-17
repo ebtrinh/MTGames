@@ -53,21 +53,29 @@ PLAYER_NAMES = ["Red", "Green", "Blue", "Yellow"]
 class Ball(Widget):
     """A marble ball that bounces around the play area"""
 
-    def __init__(self, x, y, radius=15, **kwargs):
+    def __init__(self, x, y, radius=15, is_golden=False, **kwargs):
         super(Ball, self).__init__(**kwargs)
         self.base_radius = radius  # Base radius for scaling
         self.radius = radius
         self.size = (radius * 2, radius * 2)
         self.center = (x, y)
 
-        # Random velocity
+        # Random velocity - FAST and violent
         angle = random.uniform(0, 2 * math.pi)
-        speed = random.uniform(100, 200)
+        speed = random.uniform(300, 500)
         self.vx = math.cos(angle) * speed
         self.vy = math.sin(angle) * speed
 
         self.active = True
-        self.color = (1, 1, 1, 1)  # White marble
+
+        # Golden balls are worth 3 points
+        self.is_golden = is_golden
+        if is_golden:
+            self.color = (1, 0.85, 0, 1)  # Golden yellow
+            self.points = 3
+        else:
+            self.color = (1, 1, 1, 1)  # White marble
+            self.points = 1
 
     def update_size(self, scale):
         """Update ball size based on scale factor"""
@@ -108,26 +116,27 @@ class Ball(Widget):
                 cy + ny * boundary_radius
             )
 
-            # Reflect velocity off the circular boundary
+            # Reflect velocity off the circular boundary - NO damping for violent bounces
             dot = self.vx * nx + self.vy * ny
-            self.vx = (self.vx - 2 * dot * nx) * 0.95
-            self.vy = (self.vy - 2 * dot * ny) * 0.95
+            self.vx = (self.vx - 2 * dot * nx) * 1.02  # Slight boost on bounce!
+            self.vy = (self.vy - 2 * dot * ny) * 1.02
 
-        # Add slight random movement to keep balls active
-        self.vx += random.uniform(-10, 10)
-        self.vy += random.uniform(-10, 10)
+        # Add violent random movement to keep balls chaotic
+        self.vx += random.uniform(-50, 50)
+        self.vy += random.uniform(-50, 50)
 
-        # Clamp velocity
-        max_speed = 300
+        # Clamp velocity - high speeds allowed
+        max_speed = 600
+        min_speed = 200
         speed = math.sqrt(self.vx**2 + self.vy**2)
         if speed > max_speed:
             self.vx = (self.vx / speed) * max_speed
             self.vy = (self.vy / speed) * max_speed
-        elif speed < 50:
-            # Keep minimum speed
+        elif speed < min_speed:
+            # Keep high minimum speed
             if speed > 0:
-                self.vx = (self.vx / speed) * 50
-                self.vy = (self.vy / speed) * 50
+                self.vx = (self.vx / speed) * min_speed
+                self.vy = (self.vy / speed) * min_speed
 
 
 class Hippo(Widget):
@@ -141,10 +150,15 @@ class Hippo(Widget):
         self.color = PLAYER_COLORS[player_id]
         self.score = 0
 
-        # Chomp state
-        self.is_chomping = False
-        self.chomp_progress = 0  # 0 to 1
-        self.chomp_speed = 5  # How fast the chomp animation plays
+        # Chomp state - simplified
+        self.is_active = False  # Is the hippo being pressed?
+        self.extend_progress = 0  # 0 to 1, how far head is extended out
+        self.head_scale = 1.0  # 1.0 = normal (down), 1.5 = enlarged (up/open)
+        self.has_chomped = False  # Has this press already done its chomp?
+
+        # Animation speeds
+        self.extend_speed = 8  # How fast head extends/retracts
+        self.shrink_speed = 20  # How fast head snaps down - very fast!
 
         # Base sizes (will be scaled)
         self.base_body_size = 120  # Made bigger
@@ -169,67 +183,131 @@ class Hippo(Widget):
         """Get rotation angle - hippos face inward toward center"""
         return self.angle  # Face toward center
 
-    def get_mouth_hitbox(self):
-        """Get the hitbox for the mouth when chomping"""
-        if not self.is_chomping or self.chomp_progress < 0.3:
-            return None
-
+    def get_head_center_and_radius(self):
+        """Get the current head position and radius for collision detection"""
         cx, cy = self.center
-        extend = self.mouth_extend * self.chomp_progress
-        mouth_size = self.body_size * 0.6
+        extend = self.mouth_extend * self.extend_progress
 
         # Calculate direction toward center (inward)
-        # Hippo at angle 0 is at bottom, needs to extend up (90 degrees)
-        # Hippo at angle 90 is at right, needs to extend left (180 degrees)
         angle_rad = math.radians(self.angle + 90)
         dir_x = math.cos(angle_rad)
         dir_y = math.sin(angle_rad)
 
-        # Mouth position extends inward from hippo
-        mouth_cx = cx + dir_x * extend * 0.5
-        mouth_cy = cy + dir_y * extend * 0.5
+        # Head position extends inward from hippo body
+        head_cx = cx + dir_x * extend * 0.6
+        head_cy = cy + dir_y * extend * 0.6
 
-        return (mouth_cx - mouth_size/2, mouth_cy - mouth_size/2, mouth_size, mouth_size)
+        # Head radius based on current scale
+        head_radius = self.body_size * 0.45 * self.head_scale
+
+        return head_cx, head_cy, head_radius
+
+    def get_body_center_and_radius(self):
+        """Get the hippo body position and radius for collision detection"""
+        cx, cy = self.center
+        body_radius = self.body_size * 0.5
+        return cx, cy, body_radius
+
+    def is_head_up(self):
+        """Returns True if the head is enlarged (up position) - can eat balls"""
+        return self.head_scale > 1.25 and self.extend_progress > 0.5
 
     def check_ball_collision(self, ball):
-        """Check if mouth hitbox collides with a ball"""
-        hitbox = self.get_mouth_hitbox()
-        if not hitbox:
-            return False
-
-        hx, hy, hw, hh = hitbox
+        """Check if head or body collides with a ball. Returns 'eat', 'bounce', or None"""
         bx, by = ball.center
         br = ball.radius
 
-        # Simple AABB vs circle collision
-        closest_x = max(hx, min(bx, hx + hw))
-        closest_y = max(hy, min(by, hy + hh))
+        # Check head collision if extended
+        if self.extend_progress > 0.3:
+            head_cx, head_cy, head_radius = self.get_head_center_and_radius()
+            dx = bx - head_cx
+            dy = by - head_cy
+            distance = math.sqrt(dx**2 + dy**2)
 
-        distance = math.sqrt((bx - closest_x)**2 + (by - closest_y)**2)
-        return distance < br
+            if distance < head_radius + br:
+                if self.is_head_up():
+                    return 'eat'  # Head is up/enlarged - eat the ball
+                else:
+                    return 'bounce'  # Head is down/normal - bounce the ball
+
+        # Always check body collision (even when not extended)
+        body_cx, body_cy, body_radius = self.get_body_center_and_radius()
+        dx = bx - body_cx
+        dy = by - body_cy
+        distance = math.sqrt(dx**2 + dy**2)
+
+        if distance < body_radius + br:
+            return 'bounce'  # Always bounce off body
+
+        return None
+
+    def bounce_ball(self, ball):
+        """Bounce a ball away from the hippo"""
+        bx, by = ball.center
+
+        # Determine what to bounce off of - head if extended, otherwise body
+        if self.extend_progress > 0.3:
+            center_x, center_y, radius = self.get_head_center_and_radius()
+        else:
+            center_x, center_y, radius = self.get_body_center_and_radius()
+
+        # Calculate direction from hippo to ball
+        dx = bx - center_x
+        dy = by - center_y
+        distance = math.sqrt(dx**2 + dy**2)
+
+        if distance > 0:
+            # Normalize direction
+            nx = dx / distance
+            ny = dy / distance
+
+            # Push ball out
+            push_dist = radius + ball.radius + 5
+            ball.center = (center_x + nx * push_dist, center_y + ny * push_dist)
+
+            # Reflect and boost velocity away
+            speed = math.sqrt(ball.vx**2 + ball.vy**2)
+            ball.vx = nx * max(speed, 200)
+            ball.vy = ny * max(speed, 200)
 
     def start_chomp(self):
         """Start the chomp action"""
-        if not self.is_chomping:
-            self.is_chomping = True
-            self.chomp_progress = 0
+        self.is_active = True
+        self.has_chomped = False  # New press, ready to chomp
 
     def stop_chomp(self):
-        """Stop chomping (will retract)"""
-        pass  # Chomp will naturally retract
+        """Stop chomping - head will retract"""
+        self.is_active = False
 
     def update(self, dt):
         """Update chomp animation"""
-        if self.is_chomping:
-            if len(self.active_touches) > 0:
-                # Extending
-                self.chomp_progress = min(1, self.chomp_progress + self.chomp_speed * dt)
+        if self.is_active:
+            if not self.has_chomped:
+                # Extending out AND enlarging at the same time
+                self.extend_progress = min(1, self.extend_progress + self.extend_speed * dt)
+                # Head enlarges proportionally as it extends
+                self.head_scale = 1.0 + (self.extend_progress * 0.5)  # 1.0 to 1.5
+
+                # Once fully extended, snap down
+                if self.extend_progress >= 1:
+                    self.has_chomped = True  # Mark that we've done the chomp
             else:
-                # Retracting
-                self.chomp_progress -= self.chomp_speed * dt
-                if self.chomp_progress <= 0:
-                    self.chomp_progress = 0
-                    self.is_chomping = False
+                # Already extended - snap head down to normal size
+                if self.head_scale > 1.0:
+                    self.head_scale = max(1.0, self.head_scale - self.shrink_speed * dt)
+                # Stay extended at normal size while held (do nothing else)
+        else:
+            # Released: retract head back into body
+            # First shrink head to normal if needed
+            if self.head_scale > 1.0:
+                self.head_scale = max(1.0, self.head_scale - self.shrink_speed * dt)
+            else:
+                # Then retract
+                self.extend_progress = max(0, self.extend_progress - self.extend_speed * dt)
+                if self.extend_progress <= 0:
+                    # Fully retracted, reset state
+                    self.head_scale = 1.0
+                    self.has_chomped = False
 
     def on_touch_down(self, touch):
         if self.collide_point(*touch.pos):
@@ -242,6 +320,9 @@ class Hippo(Widget):
     def on_touch_up(self, touch):
         if touch.uid in self.active_touches:
             self.active_touches.discard(touch.uid)
+            # Only stop chomping if all touches are released
+            if len(self.active_touches) == 0:
+                self.stop_chomp()
             return True
         return False
 
@@ -324,12 +405,14 @@ class HungryHipposGame(Widget):
 
         # Create balls in center
         cx, cy = self.circle_center
+        num_golden = 3  # 3 special golden balls worth 3 points each
         for i in range(self.total_balls):
             angle = random.uniform(0, 2 * math.pi)
             dist = random.uniform(0, 50 * self.scale)
             x = cx + math.cos(angle) * dist
             y = cy + math.sin(angle) * dist
-            ball = Ball(x, y, radius=18)  # Slightly bigger balls
+            is_golden = i < num_golden  # First 3 balls are golden
+            ball = Ball(x, y, radius=18 if not is_golden else 22, is_golden=is_golden)
             ball.update_size(self.scale)
             self.balls.append(ball)
 
@@ -358,10 +441,14 @@ class HungryHipposGame(Widget):
 
             # Check ball collisions
             for ball in self.balls:
-                if ball.active and hippo.check_ball_collision(ball):
-                    ball.active = False
-                    hippo.score += 1
-                    self.balls_remaining -= 1
+                if ball.active:
+                    result = hippo.check_ball_collision(ball)
+                    if result == 'eat':
+                        ball.active = False
+                        hippo.score += ball.points  # Golden balls worth 3!
+                        self.balls_remaining -= 1
+                    elif result == 'bounce':
+                        hippo.bounce_ball(ball)
 
         # Check win condition
         if self.balls_remaining <= 0:
@@ -417,6 +504,14 @@ class HungryHipposGame(Widget):
             # Draw balls
             for ball in self.balls:
                 if ball.active:
+                    # Golden ball glow effect
+                    if ball.is_golden:
+                        Color(1, 0.9, 0, 0.3)
+                        glow_size = ball.radius * 3
+                        Ellipse(
+                            pos=(ball.center_x - glow_size/2, ball.center_y - glow_size/2),
+                            size=(glow_size, glow_size)
+                        )
                     # Ball shadow
                     Color(0, 0, 0, 0.3)
                     shadow_offset = 3 * self.scale
@@ -428,7 +523,7 @@ class HungryHipposGame(Widget):
                     Color(*ball.color)
                     Ellipse(pos=ball.pos, size=ball.size)
                     # Ball shine
-                    Color(1, 1, 1, 0.4)
+                    Color(1, 1, 1, 0.5 if ball.is_golden else 0.4)
                     shine_size = ball.radius * 0.6
                     Ellipse(
                         pos=(ball.x + ball.radius * 0.3, ball.y + ball.radius * 0.8),
@@ -436,19 +531,20 @@ class HungryHipposGame(Widget):
                     )
 
     def draw_hippo(self, hippo):
-        """Draw a single hippo"""
+        """Draw a single hippo - head scales up/down for chomp animation"""
         cx, cy = hippo.center
         color = hippo.color
         scale = hippo.scale
 
-        # Calculate mouth extension based on chomp
-        extend = hippo.mouth_extend * hippo.chomp_progress
+        # Calculate animations
+        extend = hippo.mouth_extend * hippo.extend_progress  # How far out the head is
+        head_scale_factor = hippo.head_scale  # How big the head is (1.0 = normal, 1.5 = enlarged/up)
 
         with self.canvas:
             PushMatrix()
             Rotate(angle=hippo.get_rotation(), origin=(cx, cy))
 
-            # Hippo body (back part)
+            # Hippo body (back part) - stays fixed
             Color(color[0] * 0.7, color[1] * 0.7, color[2] * 0.7, 1)
             body_size = hippo.body_size
             body_offset = 25 * scale
@@ -457,69 +553,73 @@ class HungryHipposGame(Widget):
                 size=(body_size, body_size)
             )
 
-            # Hippo head
+            # Neck/connector when extended
+            if hippo.extend_progress > 0.1:
+                Color(color[0] * 0.8, color[1] * 0.8, color[2] * 0.8, 1)
+                neck_width = body_size * 0.5
+                neck_height = extend * 0.8
+                Ellipse(
+                    pos=(cx - neck_width/2, cy - neck_width/4),
+                    size=(neck_width, neck_height)
+                )
+
+            # Hippo head - extends out and scales up/down
             Color(*color)
-            head_size = body_size * 0.9
-            head_y = cy + extend * 0.3
+            base_head_size = body_size * 0.9
+            head_size = base_head_size * head_scale_factor
+            head_y = cy + extend * 0.6
+
+            # Main head ellipse
             Ellipse(
                 pos=(cx - head_size/2, head_y - head_size/3),
-                size=(head_size, head_size * 0.8)
+                size=(head_size, head_size * 0.85)
             )
 
-            # Snout
-            snout_width = head_size * 0.7
-            snout_height = head_size * 0.5
-            snout_y = head_y + head_size * 0.2 + extend * 0.5
+            # Snout (top of head) - also scales
+            snout_width = head_size * 0.75
+            snout_height = head_size * 0.45
+            snout_y = head_y + head_size * 0.25
             Color(color[0] * 1.1, color[1] * 1.1, color[2] * 1.1, 1)
             Ellipse(
                 pos=(cx - snout_width/2, snout_y),
                 size=(snout_width, snout_height)
             )
 
-            # Mouth opening (when chomping)
-            if hippo.is_chomping and hippo.chomp_progress > 0.1:
-                mouth_open = hippo.chomp_progress * 30 * scale
-                Color(0.3, 0.1, 0.1, 1)
-                Ellipse(
-                    pos=(cx - snout_width * 0.3, snout_y + snout_height * 0.2),
-                    size=(snout_width * 0.6, mouth_open)
-                )
-
-            # Eyes
-            eye_offset = head_size * 0.25
-            eye_size = 18 * scale
+            # Eyes - scale with head
+            eye_offset = head_size * 0.22
+            eye_size = 18 * scale * head_scale_factor
             Color(1, 1, 1, 1)
             Ellipse(
-                pos=(cx - eye_offset - eye_size/2, head_y + head_size * 0.1),
+                pos=(cx - eye_offset - eye_size/2, head_y + head_size * 0.05),
                 size=(eye_size, eye_size)
             )
             Ellipse(
-                pos=(cx + eye_offset - eye_size/2, head_y + head_size * 0.1),
+                pos=(cx + eye_offset - eye_size/2, head_y + head_size * 0.05),
                 size=(eye_size, eye_size)
             )
 
             # Pupils
-            pupil_size = 10 * scale
+            pupil_size = 10 * scale * head_scale_factor
             Color(0, 0, 0, 1)
             Ellipse(
-                pos=(cx - eye_offset - pupil_size/2, head_y + head_size * 0.08),
+                pos=(cx - eye_offset - pupil_size/2, head_y + head_size * 0.03),
                 size=(pupil_size, pupil_size)
             )
             Ellipse(
-                pos=(cx + eye_offset - pupil_size/2, head_y + head_size * 0.08),
+                pos=(cx + eye_offset - pupil_size/2, head_y + head_size * 0.03),
                 size=(pupil_size, pupil_size)
             )
 
-            # Nostrils
-            nostril_size = 8 * scale
-            nostril_offset = 12 * scale
+            # Nostrils - scale with head
+            nostril_size = 8 * scale * head_scale_factor
+            nostril_offset = 12 * scale * head_scale_factor
             Color(0.2, 0.1, 0.1, 1)
             Ellipse(
-                pos=(cx - nostril_offset - nostril_size/2, snout_y + snout_height * 0.6),
+                pos=(cx - nostril_offset - nostril_size/2, snout_y + snout_height * 0.55),
                 size=(nostril_size, nostril_size)
             )
             Ellipse(
-                pos=(cx + nostril_offset - nostril_size/2, snout_y + snout_height * 0.6),
+                pos=(cx + nostril_offset - nostril_size/2, snout_y + snout_height * 0.55),
                 size=(nostril_size, nostril_size)
             )
 
@@ -562,13 +662,25 @@ class HungryHipposApp(FloatLayout):
             self.score_labels.append(label)
             self.add_widget(label)
 
+        # Title box background
+        self.title_box = Widget(
+            size_hint=(None, None),
+            size=(500, 80),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5}
+        )
+        with self.title_box.canvas:
+            Color(0, 0, 0, 0.7)
+            self.title_box_rect = Rectangle(pos=self.title_box.pos, size=self.title_box.size)
+        self.title_box.bind(pos=self._update_title_box, size=self._update_title_box)
+        self.add_widget(self.title_box)
+
         # Title
         self.title_label = Label(
             text="HUNGRY HUNGRY HIPPOS",
             font_size='36sp',
             color=(1, 1, 1, 1),
             size_hint=(None, None),
-            size=(400, 60),
+            size=(500, 80),
             pos_hint={'center_x': 0.5, 'center_y': 0.5},
             bold=True
         )
@@ -586,13 +698,26 @@ class HungryHipposApp(FloatLayout):
         self.start_button.bind(on_press=self.on_start_press)
         self.add_widget(self.start_button)
 
+        # Winner box background (hidden initially)
+        self.winner_box = Widget(
+            size_hint=(None, None),
+            size=(500, 100),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5}
+        )
+        with self.winner_box.canvas:
+            Color(0, 0, 0, 0.8)
+            self.winner_box_rect = Rectangle(pos=self.winner_box.pos, size=self.winner_box.size)
+        self.winner_box.bind(pos=self._update_winner_box, size=self._update_winner_box)
+        self.add_widget(self.winner_box)
+        self.winner_box.opacity = 0
+
         # Winner label (hidden initially)
         self.winner_label = Label(
             text="",
             font_size='48sp',
             color=(1, 1, 0, 1),
             size_hint=(None, None),
-            size=(600, 80),
+            size=(500, 100),
             pos_hint={'center_x': 0.5, 'center_y': 0.5},
             bold=True
         )
@@ -616,6 +741,16 @@ class HungryHipposApp(FloatLayout):
 
         # Disable Windows gestures after a short delay
         Clock.schedule_once(lambda dt: disable_windows_touch_gestures(), 0.5)
+
+    def _update_title_box(self, *args):
+        """Update title box rectangle position"""
+        self.title_box_rect.pos = self.title_box.pos
+        self.title_box_rect.size = self.title_box.size
+
+    def _update_winner_box(self, *args):
+        """Update winner box rectangle position"""
+        self.winner_box_rect.pos = self.winner_box.pos
+        self.winner_box_rect.size = self.winner_box.size
 
     def update_ui_positions(self, *args):
         """Position score labels inside the circle between center and hippos"""
@@ -641,8 +776,12 @@ class HungryHipposApp(FloatLayout):
         self.winner_label.font_size = f'{winner_font_size}sp'
         self.balls_label.font_size = f'{balls_font_size}sp'
 
-        # Scale button size
+        # Scale button and box sizes
         self.start_button.size = (250 * scale, 70 * scale)
+        self.title_box.size = (500 * scale, 80 * scale)
+        self.title_label.size = (500 * scale, 80 * scale)
+        self.winner_box.size = (500 * scale, 100 * scale)
+        self.winner_label.size = (500 * scale, 100 * scale)
 
         if len(self.score_labels) >= 4 and circle_radius > 0:
             # Position labels inside the circle, halfway between center and hippo
@@ -679,13 +818,16 @@ class HungryHipposApp(FloatLayout):
                     self.winner_label.text = f"TIE: {names}!"
                     self.winner_label.color = (1, 1, 0, 1)
                 self.winner_label.opacity = 1
+                self.winner_box.opacity = 1
                 self.start_button.text = "PLAY AGAIN"
                 self.start_button.opacity = 1
 
     def on_start_press(self, instance):
         """Start a new game"""
         self.title_label.opacity = 0
+        self.title_box.opacity = 0
         self.winner_label.opacity = 0
+        self.winner_box.opacity = 0
         self.start_button.opacity = 0
 
         # Show all score labels
